@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     TransferError,
     TransferId,
     WriteTask,
+    as_grouped_block_ids,
     get_port_offset,
     get_role,
     zmq_ctx,
@@ -65,11 +66,22 @@ except ImportError:
 _MAX_TERMINAL_TRANSFER_IDS = 4096
 
 
-WriteGeometryKey = tuple[tuple[int, ...], tuple[int, ...], torch.dtype]
+WriteGeometryKey = tuple[int, tuple[int, ...], tuple[int, ...], torch.dtype]
 
 
-def _get_write_geometry_key(kv_cache: torch.Tensor) -> WriteGeometryKey:
-    return (tuple(kv_cache.shape), tuple(kv_cache.stride()), kv_cache.dtype)
+def _get_write_geometry_key(
+    kv_cache: torch.Tensor, group_index: int = 0
+) -> WriteGeometryKey:
+    # group_index is part of the key because under HMA two layers can share
+    # tensor geometry while belonging to different KV cache groups, and those
+    # groups carry different block ids. Keying on geometry alone would reuse
+    # one group's offsets for the other and transfer the wrong blocks.
+    return (
+        group_index,
+        tuple(kv_cache.shape),
+        tuple(kv_cache.stride()),
+        kv_cache.dtype,
+    )
 
 
 class MoRIIOWriter:
@@ -367,7 +379,8 @@ class MoRIIOWriter:
             The transfer plan
         """
         layer_cache = self.worker.kv_caches[task.layer_name]
-        geometry_key = _get_write_geometry_key(layer_cache)
+        group_index = self.worker._layer_group_indices.get(task.layer_name, 0)
+        geometry_key = _get_write_geometry_key(layer_cache, group_index)
         offsets = request_info.transfer_offsets.get(geometry_key)
         if offsets is None:
             offsets = self.worker._compute_block_transfer_offsets(
@@ -402,6 +415,10 @@ class MoRIIOWriter:
             plan: The transfer plan
             sessions: List of transfer sessions
         """
+        if not plan.transfer_local_offsets:
+            # Nothing to move for this layer: its KV cache group had no blocks
+            # (e.g. a sliding-window group clipped to empty). Not an error.
+            return []
         if plan.use_batch:
             return [
                 self.worker.moriio_wrapper.write_remote_data(
@@ -756,9 +773,14 @@ class MoRIIOWrapper:
     def _handle_remote_blocks_message(self, data: dict):
         assert get_role() == ROLE.PRODUCER, "Only prefill can get block messages"
         transfer_id = data["transfer_id"]
-        block_notify_list = data.get("block_notify_list", [])
+        # Decode sends one block list per KV cache group; tolerate the legacy
+        # flat form so a version mismatch is logged rather than silently mangled.
+        block_notify_list = as_grouped_block_ids(
+            data.get("block_notify_list", []),
+            getattr(self, "_num_kv_cache_groups", 1),
+        )
         decode_dp_rank = data.get("decode_rank", 0)
-        if not block_notify_list:
+        if not block_notify_list or not any(block_notify_list):
             raise MoRIIOError(
                 "block_notify_list cannot be empty in remote allocate message"
             )

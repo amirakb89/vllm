@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ROLE,
@@ -36,10 +37,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     ReqMeta,
     TransferId,
     WriteTask,
+    as_grouped_block_ids,
     get_moriio_mode,
     get_peer_zmq_from_request_id,
     get_port_offset,
     get_role,
+    max_group_len,
     parse_moriio_zmq_address,
     resolve_host_ip,
     set_role,
@@ -64,12 +67,18 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import (
     make_zmq_path,
     make_zmq_socket,
 )
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -186,7 +195,7 @@ def resolve_moriio_transfer_ack(
     return transfer_id
 
 
-class MoRIIOConnector(KVConnectorBase_V1):
+class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -209,7 +218,7 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self.mode = get_moriio_mode(self.kv_transfer_config)
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MoRIIOConnectorScheduler | None = (
-                MoRIIOConnectorScheduler(vllm_config, self.engine_id)
+                MoRIIOConnectorScheduler(vllm_config, self.engine_id, kv_cache_config)
             )
             self.connector_worker: MoRIIOConnectorWorker | None = None
         elif role == KVConnectorRole.WORKER:
@@ -267,6 +276,16 @@ class MoRIIOConnector(KVConnectorBase_V1):
         self,
         request: "Request",
         block_ids: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        # Legacy (non-HMA) entry point: a single flat list, which is just the
+        # one-group case. Wrap it so the scheduler has a single code path.
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request, (block_ids,))
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
@@ -351,7 +370,12 @@ class MoRIIOConnector(KVConnectorBase_V1):
 class MoRIIOConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        engine_id: str,
+        kv_cache_config: "KVCacheConfig | None" = None,
+    ):
         self.vllm_config = vllm_config
 
         assert vllm_config.kv_transfer_config is not None, (
@@ -359,6 +383,7 @@ class MoRIIOConnectorScheduler:
         )
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.block_size = vllm_config.cache_config.block_size
+        self._init_hma_state(vllm_config, kv_cache_config)
         self.engine_id: EngineId = engine_id
         self.mode = get_moriio_mode(self.kv_transfer_config)
         self.host_ip = resolve_host_ip(
@@ -378,12 +403,16 @@ class MoRIIOConnectorScheduler:
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
-        self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
-        self._reqs_need_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        # Block ids are per KV cache group: one list per group (a single group
+        # when HMA is off).
+        self._reqs_need_recv: dict[ReqId, tuple[Request, tuple[list[int], ...]]] = {}
+        self._reqs_need_save: dict[ReqId, tuple[Request, tuple[list[int], ...]]] = {}
 
         # For chunked prefill, we perform layer-wise access within the final chunk.
         # TODO: Perform transfer at end chunk.
-        self._reqs_need_pending_save: dict[ReqId, tuple[Request, list[int]]] = {}
+        self._reqs_need_pending_save: dict[
+            ReqId, tuple[Request, tuple[list[int], ...]]
+        ] = {}
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -405,6 +434,84 @@ class MoRIIOConnectorScheduler:
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+
+    def _init_hma_state(
+        self,
+        vllm_config: VllmConfig,
+        kv_cache_config: "KVCacheConfig | None",
+    ) -> None:
+        """Derive hybrid memory allocator (HMA) group state.
+
+        With HMA active the scheduler hands us one block-id list per KV cache
+        group instead of a flat list, and sliding-window groups carry padding
+        blocks that must be clipped before the ids go on the wire.
+
+        Mamba/SSM groups need speculative-slot and NULL_BLOCK_ID handling that
+        this connector does not implement, so their presence disables HMA
+        rather than risk a silently wrong transfer.
+        """
+        groups = list(kv_cache_config.kv_cache_groups) if kv_cache_config else []
+        self._has_mamba = any(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+        self._is_hma_required = (
+            bool(groups)
+            and not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+            # Covers the SW-only model case too, rather than checking num_groups > 1.
+            and any(not isinstance(g.kv_cache_spec, FullAttentionSpec) for g in groups)
+        )
+        if self._has_mamba and self._is_hma_required:
+            logger.warning(
+                "MoRIIO: disabling HMA because this model has Mamba/SSM KV cache "
+                "groups, which this connector does not support yet."
+            )
+            self._is_hma_required = False
+
+        # Sliding-window extent per group, in blocks; 0 for non-SWA groups.
+        # cdiv(window, block_size) + 1 conservatively covers a window that is
+        # not block aligned.
+        self.blocks_per_sw: list[int] = []
+        for g in groups:
+            spec = g.kv_cache_spec
+            if isinstance(spec, SlidingWindowSpec) and spec.sliding_window:
+                self.blocks_per_sw.append(
+                    cdiv(spec.sliding_window, spec.block_size) + 1
+                )
+            else:
+                self.blocks_per_sw.append(0)
+
+        logger.info(
+            "MoRIIO HMA state: enabled=%s, kv_cache_groups=%d, blocks_per_sw=%s",
+            self._is_hma_required,
+            len(groups),
+            self.blocks_per_sw,
+        )
+
+    def get_sw_clipped_blocks(
+        self, block_ids: "tuple[list[int], ...] | list[list[int]]"
+    ) -> tuple[list[int], ...]:
+        """Clip sliding-window groups down to their in-window tail.
+
+        HMA allocates blocks for the whole sequence and marks the out-of-window
+        ones rather than removing them (they appear at the start of the list),
+        so every block-id exchange point must unpad first. Otherwise the peer
+        is told to read blocks that were never written, which corrupts the KV
+        silently instead of raising. Mirrors NIXL's get_exchange_clipped_blocks
+        and Mooncake's get_sw_clipped_blocks.
+        """
+        if not block_ids or not self._is_hma_required:
+            return tuple(block_ids)
+        if len(block_ids) != len(self.blocks_per_sw):
+            logger.error(
+                "MoRIIO: block-id group count %d != KV cache group count %d; "
+                "skipping sliding-window clip. Transfers may be incorrect.",
+                len(block_ids),
+                len(self.blocks_per_sw),
+            )
+            return tuple(block_ids)
+        clipped: list[list[int]] = []
+        for i, blocks in enumerate(block_ids):
+            n_sw = self.blocks_per_sw[i]
+            clipped.append(list(blocks[-n_sw:]) if n_sw and blocks else list(blocks))
+        return tuple(clipped)
 
     def map_request_id(self, request_id: ReqId, transfer_id: TransferId):
         self.transfer_id_to_request_id[transfer_id] = request_id
@@ -541,7 +648,15 @@ class MoRIIOConnectorScheduler:
         request_id = request.request_id
         self.map_request_id(request_id, transfer_id)
         if params.get("do_remote_decode"):
-            local_block_ids = blocks.get_block_ids()[0]
+            # Keep every KV cache group; under HMA get_block_ids() returns one
+            # list per group and taking [0] would silently drop the rest.
+            # NOTE: stored unclipped. Chunked prefill accumulates into
+            # _reqs_need_pending_save across steps, so sliding-window clipping
+            # is applied once at the exchange point in build_connector_meta --
+            # clipping here would concatenate clipped and unclipped chunks.
+            local_block_ids = tuple(
+                list(group) for group in blocks.get_block_ids()
+            )
             self._reqs_need_save[request.request_id] = (request, local_block_ids)
 
         if params is not None and params.get("do_remote_prefill"):
@@ -551,18 +666,33 @@ class MoRIIOConnectorScheduler:
                     # host/ports come from the request_id (parsed in add_new_req).
                     if "remote_engine_id" in params:
                         if num_external_tokens > 0:
-                            # Get unhashed blocks to pull from remote.
-                            local_block_ids = blocks.get_block_ids()[0]
-                            assert len(local_block_ids) <= len(remote_block_ids)
-                            if len(local_block_ids) != len(remote_block_ids):
-                                local_block_ids = remote_block_ids[
-                                    -len(local_block_ids) :
-                                ]
+                            # Get unhashed blocks to pull from remote, per group.
+                            local_groups = self.get_sw_clipped_blocks(
+                                blocks.get_block_ids()
+                            )
+                            remote_groups = as_grouped_block_ids(
+                                remote_block_ids, len(local_groups)
+                            )
+                            aligned: list[list[int]] = []
+                            for g, local_g in enumerate(local_groups):
+                                remote_g = (
+                                    remote_groups[g] if g < len(remote_groups) else []
+                                )
+                                assert len(local_g) <= len(remote_g), (
+                                    f"group {g}: local blocks {len(local_g)} > "
+                                    f"remote blocks {len(remote_g)}"
+                                )
+                                # Partial prefix hit: read only the tail we lack.
+                                if len(local_g) != len(remote_g):
+                                    aligned.append(list(remote_g[-len(local_g) :]))
+                                else:
+                                    aligned.append(list(local_g))
+                            local_block_ids = tuple(aligned)
                         else:
                             # If remote_blocks and num_external_tokens = 0, we have
                             # a full prefix cache hit on the D worker. We need to call
                             # send_notify in _read_blocks to free the memory on the P.
-                            local_block_ids = []
+                            local_block_ids = ()
 
                         self._reqs_need_recv[request.request_id] = (
                             request,
@@ -597,8 +727,12 @@ class MoRIIOConnectorScheduler:
 
                 # num_external_tokens == 0: nothing to push, so don't tell the
                 # producer to write into these blocks.
+                # Sent as a list of per-group lists; the producer pairs group g
+                # of its own blocks with group g of ours.
                 block_notify_list = (
-                    blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                    [list(g) for g in self.get_sw_clipped_blocks(blocks.get_block_ids())]
+                    if num_external_tokens > 0
+                    else []
                 )
 
                 for tp_index in range(self.tp_size):
@@ -634,18 +768,24 @@ class MoRIIOConnectorScheduler:
                 new_block_ids = scheduler_output.scheduled_cached_reqs.new_block_ids[i]
 
                 if new_block_ids is not None:
-                    block_ids = new_block_ids[0]
-                    # TODO : hybrid attn, etc
-                    req, existing_blocks = self._reqs_need_pending_save[req_id]
-                    updated_blocks = list(existing_blocks) + (block_ids)
+                    # Concatenate group-wise: new_block_ids carries one list per
+                    # KV cache group, and so does what we accumulated so far.
+                    new_groups = as_grouped_block_ids(new_block_ids)
+                    req, existing_groups = self._reqs_need_pending_save[req_id]
+                    n_groups = max(len(existing_groups), len(new_groups))
+                    updated_blocks = tuple(
+                        list(existing_groups[g] if g < len(existing_groups) else [])
+                        + list(new_groups[g] if g < len(new_groups) else [])
+                        for g in range(n_groups)
+                    )
                     self._reqs_need_pending_save[req_id] = (req, updated_blocks)
                     if (
-                        len(self._reqs_need_pending_save[req_id][1]) * self.block_size
+                        max_group_len(updated_blocks) * self.block_size
                         >= req.num_prompt_tokens
                     ):
                         meta.add_new_req(
                             request_id=req_id,
-                            local_block_ids=self._reqs_need_pending_save[req_id][1],
+                            local_block_ids=self.get_sw_clipped_blocks(updated_blocks),
                             kv_transfer_params=req.kv_transfer_params or {},
                             write_mode=True,
                         )
@@ -662,13 +802,15 @@ class MoRIIOConnectorScheduler:
 
         for req_id, (req, block_ids) in self._reqs_need_save.items():
             assert req.kv_transfer_params is not None
-            if req.num_prompt_tokens > len(block_ids) * self.block_size:
+            # Longest group tracks the full sequence; sliding-window groups are
+            # shorter by construction, so max() is the right chunk-completion test.
+            if req.num_prompt_tokens > max_group_len(block_ids) * self.block_size:
                 # not last chunk prefill
                 self._reqs_need_pending_save[req_id] = (req, block_ids)
                 continue
             meta.add_new_req(
                 request_id=req_id,
-                local_block_ids=block_ids,
+                local_block_ids=self.get_sw_clipped_blocks(block_ids),
                 kv_transfer_params=req.kv_transfer_params,
                 write_mode=True,
             )
@@ -694,7 +836,7 @@ class MoRIIOConnectorScheduler:
     def request_finished(
         self,
         request: "Request",
-        block_ids: list[int],
+        block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
         Once a request is finished, determine whether request blocks
@@ -742,10 +884,14 @@ class MoRIIOConnectorScheduler:
         ):
             return False, None
 
-        # computed_block_ids = block_ids if all_full else block_ids[:-1]
-        computed_block_ids = block_ids
+        # Unpad sliding-window groups: HMA allocates for the whole sequence and
+        # only marks the out-of-window blocks, so the ids sent to D must be
+        # clipped or it reads blocks that were never written.
+        computed_block_ids = [
+            list(group) for group in self.get_sw_clipped_blocks(block_ids)
+        ]
         # If prompt < block_size, no xfer so free blocks immediately.
-        delay_free_blocks = len(computed_block_ids) > 0
+        delay_free_blocks = any(len(group) > 0 for group in computed_block_ids)
 
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
@@ -857,6 +1003,16 @@ class MoRIIOConnectorWorker:
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.is_producer = self.kv_transfer_config.is_kv_producer
         self.layer_to_spec = build_layer_to_spec(kv_cache_config)
+        # Which KV cache group each layer belongs to. Under HMA block ids arrive
+        # as one list per group, so the read/write paths need this to pick the
+        # right list for a given layer. Without HMA there is exactly one group
+        # and every layer maps to 0, reproducing the previous flat behaviour.
+        self._layer_group_indices: dict[str, int] = {
+            layer_name: group_index
+            for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+        }
+        self.num_kv_cache_groups = max(len(kv_cache_config.kv_cache_groups), 1)
 
         if self.is_producer:
             set_role(ROLE.PRODUCER)
@@ -935,6 +1091,8 @@ class MoRIIOConnectorWorker:
             transfer_timeout=self.moriio_config.transfer_timeout,
         )
         self.moriio_wrapper.set_moriio_engine(self.moriio_engine)
+        # Lets the wrapper detect a peer that sent flat (pre-HMA) block ids.
+        self.moriio_wrapper._num_kv_cache_groups = self.num_kv_cache_groups
         backend = (
             BackendType.XGMI
             if self.moriio_config.backend == "xgmi"
@@ -1052,8 +1210,8 @@ class MoRIIOConnectorWorker:
         request_id: ReqId,
         transfer_id: TransferId,
         dst_engine_id: str,
-        local_block_ids: list[int],
-        remote_block_ids: list[int] | None,
+        local_block_ids: "tuple[list[int], ...]",
+        remote_block_ids: "tuple[list[int], ...] | None",
         layer_name: str,
         kv_layer: torch.Tensor,
         remote_notify_port: int,
@@ -1464,6 +1622,32 @@ class MoRIIOConnectorWorker:
         self.num_blocks = first_geometry.num_blocks
         self.slot_size_bytes = first_geometry.slot_size_bytes
         assert first_geometry.block_size == self.block_size
+
+        # self.num_blocks is taken from the first layer and advertised to the
+        # peer as a single scalar, which feeds remote_kv_stride (the K->V
+        # distance in the remote tensor). Under HMA that is only sound if every
+        # KV cache group has the same block count. If a future model breaks that
+        # assumption the V offsets would be silently wrong, so check loudly here
+        # rather than corrupt the cache.
+        if self.num_kv_cache_groups > 1:
+            per_layer_num_blocks = {
+                self._get_layer_transfer_geometry(ln).num_blocks for ln in kv_caches
+            }
+            if len(per_layer_num_blocks) > 1:
+                logger.error(
+                    "MoRIIO HMA: KV cache groups have differing block counts %s. "
+                    "num_blocks is advertised as a single scalar, so remote V "
+                    "offsets will be wrong. Disable HMA "
+                    "(--disable-hybrid-kv-cache-manager) until per-group "
+                    "num_blocks is plumbed through MoRIIOAgentMetadata.",
+                    sorted(per_layer_num_blocks),
+                )
+            else:
+                logger.info(
+                    "MoRIIO HMA: %d KV cache groups, uniform num_blocks=%d",
+                    self.num_kv_cache_groups,
+                    self.num_blocks,
+                )
         # TODO(tms): self.block_len needs to be per-layer for sliding window,
         # hybrid attn, etc
         # block size in bytes
@@ -2127,11 +2311,29 @@ class MoRIIOConnectorWorker:
 
         return merged_local, merged_remote, merged_sizes
 
+    def _group_blocks_for_layer(
+        self,
+        layer_name: str,
+        grouped_block_ids: "tuple[list[int], ...] | list[list[int]]",
+    ) -> list[int]:
+        """Select the block-id list belonging to this layer's KV cache group."""
+        group_index = self._layer_group_indices.get(layer_name, 0)
+        if group_index < len(grouped_block_ids):
+            return list(grouped_block_ids[group_index])
+        logger.error(
+            "MoRIIO: layer %s belongs to KV cache group %d but only %d block-id "
+            "groups were supplied; skipping this layer's transfer.",
+            layer_name,
+            group_index,
+            len(grouped_block_ids),
+        )
+        return []
+
     def _compute_block_transfer_offsets(
         self,
         layer_name: str,
-        local_block_ids: list[int],
-        remote_block_ids: list[int],
+        local_block_ids: "tuple[list[int], ...] | list[list[int]]",
+        remote_block_ids: "tuple[list[int], ...] | list[list[int]]",
         remote_moriio_meta: MoRIIOAgentMetadata,
         remote_tp_size: int | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
@@ -2139,8 +2341,8 @@ class MoRIIOConnectorWorker:
 
         Args:
             layer_name: Name of the layer to transfer
-            local_block_ids: IDs of local blocks
-            remote_block_ids: IDs of remote blocks
+            local_block_ids: per-KV-cache-group lists of local block IDs
+            remote_block_ids: per-KV-cache-group lists of remote block IDs
             remote_moriio_meta: Metadata of the remote MoRIIO agent
         Returns:
             Tuple of (local_offsets, remote_offsets, transfer_sizes)
@@ -2155,12 +2357,17 @@ class MoRIIOConnectorWorker:
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             is_mla=self._is_mla_cache_layer(layer_name),
         )
+        # A layer only ever transfers the blocks of its own KV cache group.
+        local_group = self._group_blocks_for_layer(layer_name, local_block_ids)
+        remote_group = self._group_blocks_for_layer(layer_name, remote_block_ids)
+        if not local_group or not remote_group:
+            return [], [], []
         return compute_block_transfer_offsets(
             layer_name=layer_name,
             kv_cache=self.kv_caches[layer_name],
             layer_to_spec=self.layer_to_spec,
-            local_block_ids=local_block_ids,
-            remote_block_ids=remote_block_ids,
+            local_block_ids=local_group,
+            remote_block_ids=remote_group,
             remote_num_blocks=remote_moriio_meta.num_blocks,
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
@@ -2186,8 +2393,8 @@ class MoRIIOConnectorWorker:
 
     def _read_blocks(
         self,
-        local_block_ids: list[int],
-        remote_block_ids: list[int],
+        local_block_ids: "tuple[list[int], ...]",
+        remote_block_ids: "tuple[list[int], ...]",
         dst_engine_id: str,
         request_id: str,
         transfer_id: str,
@@ -2239,6 +2446,10 @@ class MoRIIOConnectorWorker:
                 remote_moriio_meta,
                 remote_tp_size=remote_tp_size,
             )
+            if not offs[0]:
+                # This layer's KV cache group has no blocks to read (e.g. a
+                # sliding-window group clipped to empty). Skip it.
+                continue
             # TODO : apply multi-session batch-read when moriio support it
             #
             # SQ-full backpressure: read_remote_data posts the RDMA READ

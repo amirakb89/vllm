@@ -37,6 +37,36 @@ from enum import Enum
 logger = init_logger(__name__)
 
 
+def as_grouped_block_ids(
+    block_ids: Any,
+    expected_groups: int = 1,
+) -> tuple[list[int], ...]:
+    """Normalise a block-id payload to one list per KV cache group.
+
+    Accepts the grouped form (list of lists) that HMA-aware peers send, and the
+    legacy flat form. A flat list arriving at a multi-group instance means the
+    peer predates grouped block ids: prefill and decode must be upgraded
+    together, so log loudly rather than silently reinterpreting it.
+    """
+    if not block_ids:
+        return ()
+    if isinstance(block_ids[0], (list, tuple)):
+        return tuple(list(group) for group in block_ids)
+    if expected_groups > 1:
+        logger.error(
+            "MoRIIO: peer sent a flat block-id list but this instance has %d KV "
+            "cache groups. Prefill and decode must both support HMA; treating "
+            "the list as group 0 only, transfers will be incomplete.",
+            expected_groups,
+        )
+    return (list(block_ids),)
+
+
+def max_group_len(block_ids: "tuple[list[int], ...] | list[list[int]]") -> int:
+    """Longest per-group block list, i.e. the group covering the most tokens."""
+    return max((len(group) for group in block_ids), default=0)
+
+
 Transfer = tuple[int, float]
 EngineId = str
 ReqId = str
@@ -53,8 +83,9 @@ class WriteTask:
     request_id: ReqId
     transfer_id: TransferId
     dst_engine_id: str
-    local_block_ids: list[int]
-    remote_block_ids_hint: list[int] | None
+    # Per KV cache group, matching ReqMeta.
+    local_block_ids: tuple[list[int], ...]
+    remote_block_ids_hint: tuple[list[int], ...] | None
     layer_name: str
     event: torch.cuda.Event
     remote_notify_port: int
@@ -81,7 +112,8 @@ class LayerTransferPlan:
 class RemoteAllocInfo:
     """Information about remote block allocation."""
 
-    block_ids: list[int]
+    # Decode-side blocks to write into, one list per KV cache group.
+    block_ids: tuple[list[int], ...]
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0
@@ -413,8 +445,9 @@ class ReqMeta:
     """Metadata for a single request."""
 
     transfer_id: TransferId
-    local_block_ids: list[int]
-    remote_block_ids: list[int]
+    # One block-id list per KV cache group (a single group when HMA is off).
+    local_block_ids: tuple[list[int], ...]
+    remote_block_ids: tuple[list[int], ...]
     remote_host: str
     remote_port: int
     remote_handshake_port: int
@@ -446,7 +479,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
     def add_new_req(
         self,
         request_id: ReqId,
-        local_block_ids: list[int],
+        local_block_ids: tuple[list[int], ...],
         kv_transfer_params: dict[str, Any],
         write_mode=False,
     ):
@@ -468,10 +501,15 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
                 parse_moriio_zmq_address(peer_zmq)
             )
 
+        local_groups = tuple(list(group) for group in local_block_ids)
+        remote_groups = as_grouped_block_ids(
+            kv_transfer_params["remote_block_ids"], len(local_groups) or 1
+        )
+
         _req = ReqMeta(
             transfer_id=transfer_id,
-            local_block_ids=local_block_ids,
-            remote_block_ids=kv_transfer_params["remote_block_ids"],
+            local_block_ids=local_groups,
+            remote_block_ids=remote_groups,
             remote_engine_id=kv_transfer_params["remote_engine_id"],
             remote_host=remote_host,
             remote_port=int(remote_handshake_port),
