@@ -479,10 +479,20 @@ class MoRIIOWriter:
         # to eliminate the need for this notification.
         # Consider including the first gen token from prefill in the notification
 
-        # Send completion notification
-        self.worker.moriio_wrapper.send_notify(
-            transfer_id, remote_ip, remote_port, message_type="write_done"
-        )
+        # Send completion notification.
+        # [FAULT-INJECT] Env-gated drop to simulate a lost write_done for
+        # end-to-end testing of the WRITE-mode consumer watchdog (ROCm/mori#655).
+        # Off unless MORIIO_FAULT_DROP_WRITE_DONE=1, so production is unaffected.
+        import os as _os
+
+        if _os.environ.get("MORIIO_FAULT_DROP_WRITE_DONE") == "1":
+            logger.error(
+                "[FAULT-INJECT] dropping write_done for transfer_id=%s", transfer_id
+            )
+        else:
+            self.worker.moriio_wrapper.send_notify(
+                transfer_id, remote_ip, remote_port, message_type="write_done"
+            )
         # mark request as done, then we can free the blocks
         with self.worker.moriio_wrapper.lock:
             self.worker.moriio_wrapper.done_req_ids.append(
