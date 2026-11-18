@@ -87,6 +87,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_layout import (
     kda_conv_ssm,
     validate_transfer_block_ids,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_peers import (
+    PeerTracker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_tp_mapping import (
     MoRIIOWriteTPMapping,
     WriteTarget,
@@ -599,6 +602,8 @@ class MoRIIOConnectorScheduler:
         )
         self.kv_transfer_config = vllm_config.kv_transfer_config
         self.mode = get_moriio_mode(self.kv_transfer_config)
+        # This launch; the workers use the same one (MoRIIOConnectorWorker).
+        self.incarnation = vllm_config.instance_id
         self._attn_group_ids, self._mamba_group_ids = _split_kv_cache_group_kinds(
             kv_cache_config
         )
@@ -798,6 +803,10 @@ class MoRIIOConnectorScheduler:
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # A READ decode tracks the prefills it reads from, to notice a restart.
+        self._peers: PeerTracker | None = None
+        if not self.is_producer and self.mode == MoRIIOMode.READ:
+            self._peers = PeerTracker()
 
     def get_exchange_clipped_blocks(
         self,
@@ -1557,7 +1566,21 @@ class MoRIIOConnectorScheduler:
         self._reqs_need_save.clear()
         self._reqs_need_send = {}
 
+        if self._peers is not None:
+            self._update_peers(meta)
         return meta
+
+    def _update_peers(self, meta: MoRIIOConnectorMetadata) -> None:
+        """Hand the workers the prefills that restarted, in the step of the
+        first read from the new launch."""
+        assert self._peers is not None
+        for req_meta in meta.reqs_to_recv.values():
+            self._peers.note_request(
+                f"{req_meta.remote_host}:{req_meta.remote_handshake_port}",
+                dp_rank=int(req_meta.remote_dp_rank),
+                incarnation=req_meta.remote_incarnation,
+            )
+        meta.peers_to_drop = self._peers.take_drops()
 
     def shutdown(self):
         for path, sock in self.paths.items():
@@ -1716,7 +1739,6 @@ class MoRIIOConnectorScheduler:
                 cast(BlockIds, block_ids)
             )
         delay_free_blocks = any(len(group) > 0 for group in computed_block_ids)
-
         if delay_free_blocks:
             # Prefill request on remote. It will be read from D upon completion
             self._reqs_need_send[request.request_id] = (
@@ -1751,6 +1773,9 @@ class MoRIIOConnectorScheduler:
             ),
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             transfer_id=params["transfer_id"],
+            # Lets a READ decode tell a restarted prefill from the one it has
+            # sessions to.
+            remote_incarnation=self.incarnation,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -1946,6 +1971,9 @@ class MoRIIOConnectorWorker:
         self._completed_consumer_notifications: set[TransferId] = set()
 
         role = "producer" if self.is_producer else "consumer"
+        # One launch of this engine. The scheduler and the workers share it
+        # through the config, and a restart changes it.
+        self.incarnation = vllm_config.instance_id
         engine_suffix = (
             f"{self.moriio_config.local_ip}:{self.moriio_config.handshake_port}:"
             f"tp{self.tp_rank}:dp{self.dp_rank}"
@@ -1953,6 +1981,11 @@ class MoRIIOConnectorWorker:
         if self.pp_size > 1:
             # MoRI peers address engines by this key; stages need distinct keys.
             engine_suffix += f":pp{self.pp_rank}"
+        # MoRI keeps a peer's QPs and sessions by engine key, and deregistering
+        # the key does not drop them. A restarted engine must therefore come
+        # back under a new key, or its peers would keep posting on QPs whose
+        # other end is gone.
+        engine_suffix += f":{self.incarnation}"
         self.moriio_engine = IOEngine(
             f"{role}:{engine_suffix}",
             IOEngineConfig(
@@ -2179,6 +2212,63 @@ class MoRIIOConnectorWorker:
             tp_mapping=tp_mapping,
         )
         self._writer.schedule_write(task)
+
+    def invalidate_remote_peer(
+        self, remote_engine_id: str, reason: str, current_incarnation: str = ""
+    ) -> None:
+        """Forget every session to a peer so the next request handshakes again.
+
+        remote_engine_id is the peer's base id (host:handshake port); its
+        per-(dp, tp) session keys are dropped with it. A session already built
+        for current_incarnation is kept, so a late report about the old peer
+        cannot undo a handshake with the new one.
+        """
+        prefix = f"{remote_engine_id}_dp"
+        dropped = []
+        with self._handshake_lock:
+            eids = {
+                eid
+                for table in (
+                    self._remote_agents,
+                    self.remote_moriio_metadata,
+                    self.layer_name_to_remote_kv_cache_metadata,
+                    self.built_write_session,
+                )
+                for eid in table
+                if eid == remote_engine_id or eid.startswith(prefix)
+            }
+            for eid in eids:
+                meta = self.remote_moriio_metadata.get(eid)
+                if (
+                    current_incarnation
+                    and meta is not None
+                    and meta.incarnation == current_incarnation
+                ):
+                    continue
+                self.remote_moriio_metadata.pop(eid, None)
+                self._remote_agents.pop(eid, None)
+                self.layer_name_to_remote_kv_cache_metadata.pop(eid, None)
+                self.built_write_session.pop(eid, None)
+                if meta is not None:
+                    try:
+                        self.moriio_wrapper.deregister_remote_engine(
+                            meta.agent_metadata
+                        )
+                    except Exception:
+                        logger.debug(
+                            "MoRIIO: deregistering %s failed", eid, exc_info=True
+                        )
+                dropped.append(eid)
+            if dropped:
+                self.write_ready_flags.pop(remote_engine_id, None)
+                self.load_ready_flag.pop(remote_engine_id, None)
+        if dropped:
+            logger.warning(
+                "MoRIIO: dropped the sessions to %s (%s); the next request "
+                "to it handshakes again",
+                ", ".join(sorted(dropped)),
+                reason,
+            )
 
     def _get_built_session(self, remote_engine_id):
         if remote_engine_id not in self.built_write_session:
@@ -2927,6 +3017,7 @@ class MoRIIOConnectorWorker:
             },
             attention_block_sizes=self.attention_block_sizes,
             layer_base_addr_index=self.layer_base_addr_index,
+            incarnation=self.incarnation,
         )
         ready_event = threading.Event()
         self._moriio_handshake_listener_t = threading.Thread(
@@ -3435,6 +3526,11 @@ class MoRIIOConnectorWorker:
         We check for these trnxs to complete in each step().
         """
         self.transfer_id_to_request_id = metadata.transfer_id_to_request_id
+        # Every worker drops the same peers at the same step, so the READ eager
+        # handshake below stays in lockstep across TP ranks.
+        for peer_id, (reason, keep_incarnation) in metadata.peers_to_drop.items():
+            self.invalidate_remote_peer(peer_id, reason, keep_incarnation)
+            self._eager_handshaked_engines.discard(peer_id)
         if self.is_producer:
             live_transfer_ids = set(self.transfer_id_to_request_id)
             self._consumer_notification_counts = {
@@ -3593,6 +3689,7 @@ class MoRIIOConnectorWorker:
             remote_dp_rank=meta.remote_dp_rank,
             chosen_tp=chosen_tp,
             flexible=flexible,
+            remote_incarnation=meta.remote_incarnation,
         )
 
     def _layer_total_num_kv_heads(self, layer_name: str | None = None) -> int:
@@ -4195,6 +4292,7 @@ class MoRIIOConnectorWorker:
         remote_dp_rank: int = 0,
         chosen_tp: int | None = None,
         flexible: bool = False,
+        remote_incarnation: str = "",
     ) -> None:
         if self.mode == MoRIIOMode.WRITE:
             return
@@ -4267,6 +4365,26 @@ class MoRIIOConnectorWorker:
                 dst_engine_id, int(remote_dp_rank)
             )
         sessions, remote_moriio_meta = self._get_built_session(remote_dp_engine_id)
+        if (
+            remote_incarnation
+            and remote_moriio_meta.incarnation
+            and remote_incarnation != remote_moriio_meta.incarnation
+        ):
+            # The KV was computed by another launch of the prefill than the one
+            # the sessions reach: its blocks are gone, and these block ids name
+            # other KV now. Reading them would load the wrong KV.
+            reason = (
+                f"request {request_id} names prefill incarnation "
+                f"{remote_incarnation}, but {remote_dp_engine_id} is "
+                f"{remote_moriio_meta.incarnation}"
+            )
+            if self._has_mamba:
+                raise MoRIIOError(f"MoRIIO hybrid READ from another prefill: {reason}")
+            logger.error("MoRIIO: not reading %s; recording a load error", reason)
+            self._invalid_block_ids.update(
+                block_id for group in local_block_ids for block_id in group
+            )
+            return
 
         # SQ-full backpressure deadline, shared across this request's layers.
         _sq_deadline = time.monotonic() + self.moriio_config.transfer_timeout

@@ -749,7 +749,9 @@ def test_producer_start_load_kv_posts_no_read():
     worker._completed_consumer_notifications = set()
     worker.moriio_wrapper = RecordingWrapper()
 
-    worker.start_load_kv(SimpleNamespace(transfer_id_to_request_id={}))
+    worker.start_load_kv(
+        SimpleNamespace(transfer_id_to_request_id={}, peers_to_drop={})
+    )
 
     assert worker._reads_issued_this_step == []
     assert worker.moriio_wrapper.async_waited is True
