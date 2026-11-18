@@ -605,10 +605,11 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
-        # Peers (host:handshake_port) whose sessions every worker drops before
-        # this step's transfers: reason, and the incarnation whose sessions to
-        # keep ("" for none).
-        self.peers_to_drop: dict[EngineId, tuple[str, str]] = {}
+        # Remote ranks whose launch the scheduler learned this step: peer
+        # (host:handshake_port) -> {dp rank: incarnation}. Every worker drops
+        # its sessions to another launch of those ranks before this step's
+        # handshakes.
+        self.peer_incarnations: dict[EngineId, dict[int, str]] = {}
 
     def __repr__(self):
         return (
@@ -616,7 +617,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             f"reqs_to_save={self.reqs_to_save}, "
             f"reqs_to_send={self.reqs_to_send}, "
             f"transfer_id_to_request_id={self.transfer_id_to_request_id}, "
-            f"peers_to_drop={self.peers_to_drop}"
+            f"peer_incarnations={self.peer_incarnations}"
         )
 
     def add_new_req(

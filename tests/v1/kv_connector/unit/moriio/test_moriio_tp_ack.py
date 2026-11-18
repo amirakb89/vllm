@@ -750,7 +750,7 @@ def test_producer_start_load_kv_posts_no_read():
     worker.moriio_wrapper = RecordingWrapper()
 
     worker.start_load_kv(
-        SimpleNamespace(transfer_id_to_request_id={}, peers_to_drop={})
+        SimpleNamespace(transfer_id_to_request_id={}, peer_incarnations={})
     )
 
     assert worker._reads_issued_this_step == []
