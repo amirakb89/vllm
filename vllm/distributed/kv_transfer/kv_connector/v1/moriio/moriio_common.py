@@ -152,6 +152,10 @@ class MoRIIOAgentMetadata(
     # Layer name -> index of its first region in kv_caches_base_addr. Peers can
     # register different layers (a pipeline stage holds a slice of them).
     layer_base_addr_index: dict[str, int] = {}
+    # Identifies one launch of the peer. It changes when the peer restarts, and
+    # with it the peer's engine key, memory registrations and QPs, so sessions
+    # built for an older incarnation must not be used ("" from older peers).
+    incarnation: str = ""
 
 
 class RoleManager:
@@ -591,6 +595,8 @@ class ReqMeta:
     multi_pod_hosts: list[str] = field(default_factory=list)
     # Per-pod DP size; 0 means fallback to remote_dp_size.
     remote_dp_size_local: int = 0
+    # Incarnation of the prefill that computed the KV, when it sends one (READ).
+    remote_incarnation: str = ""
 
 
 class MoRIIOConnectorMetadata(KVConnectorMetadata):
@@ -599,13 +605,19 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
+        # Remote ranks whose launch the scheduler learned this step: peer
+        # (host:handshake_port) -> {dp rank: incarnation}. Every worker drops
+        # its sessions to another launch of those ranks before this step's
+        # handshakes.
+        self.peer_incarnations: dict[EngineId, dict[int, str]] = {}
 
     def __repr__(self):
         return (
             f"MoRIIOConnectorMetadata: reqs_to_recv={self.reqs_to_recv}, "
             f"reqs_to_save={self.reqs_to_save}, "
             f"reqs_to_send={self.reqs_to_send}, "
-            f"transfer_id_to_request_id={self.transfer_id_to_request_id}"
+            f"transfer_id_to_request_id={self.transfer_id_to_request_id}, "
+            f"peer_incarnations={self.peer_incarnations}"
         )
 
     def add_new_req(
@@ -711,6 +723,7 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
             remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
             multi_pod_hosts=_pod_hosts,
             remote_dp_size_local=_remote_dp_size_local,
+            remote_incarnation=str(kv_transfer_params.get("remote_incarnation") or ""),
         )
         if write_mode:
             self.reqs_to_save[request_id] = _req

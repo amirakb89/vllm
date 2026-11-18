@@ -145,6 +145,7 @@ def _setup_kv_transfer_request(
 
 def _write_consumer_scheduler_for_finished_request(tp_size: int = 2):
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler._peers = None
     scheduler.is_producer = False
     scheduler.kv_transfer_config = SimpleNamespace(kv_connector_extra_config={})
     scheduler.mode = MoRIIOMode.WRITE
@@ -159,6 +160,7 @@ def _write_producer_scheduler(block_size: int = 1) -> Any:
     """Bare WRITE-mode PRODUCER scheduler exercising the save path without a
     real engine/RDMA stack. Uses a single full-attention KV group (index 0)."""
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler._peers = None
     scheduler.mode = MoRIIOMode.WRITE
     scheduler.is_producer = True
     scheduler.block_size = block_size
@@ -675,7 +677,11 @@ def test_register_kv_caches(mock_parallel_groups):
         )
 
         # Verify engine keys
-        expected_engine_key = f"{ROLE[3:]}:{IP}:{DEFAULT_PORT}:tp{TP_RANK}:dp{DP_RANK}"
+        # The engine key ends with this launch's incarnation.
+        expected_engine_key = (
+            f"{ROLE[3:]}:{IP}:{DEFAULT_PORT}:tp{TP_RANK}:dp{DP_RANK}"
+            f":{connector.connector_worker.incarnation}"
+        )
         assert (
             MemoryDesc.unpack(
                 connector.connector_worker.layer_name_to_local_kv_cache_metadata[
@@ -1305,7 +1311,9 @@ def test_pipeline_stage_has_its_own_engine_and_ports(mock_parallel_groups, pp_ra
     # One TP rank per stage, so stage s sits at offset s.
     assert worker.side_channel_port == 12347 + pp_rank
     assert worker.notify_port == 12348 + pp_rank
-    assert worker.moriio_engine.get_engine_desc().key.endswith(f":tp0:dp0:pp{pp_rank}")
+    assert worker.moriio_engine.get_engine_desc().key.endswith(
+        f":tp0:dp0:pp{pp_rank}:{worker.incarnation}"
+    )
 
 
 @pytest.mark.parametrize(

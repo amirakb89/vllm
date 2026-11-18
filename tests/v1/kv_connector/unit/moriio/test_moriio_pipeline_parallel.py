@@ -115,6 +115,7 @@ def _decode_scheduler(*, send: bool = False) -> MoRIIOConnectorScheduler:
     scheduler._is_hma_required = False
     scheduler._is_kv_master = True
     scheduler._global_dp_rank = 0
+    scheduler.incarnation = "decode-1"
     scheduler.transfer_id_to_request_id = {}
     scheduler.request_id_to_transfer_id = {}
     scheduler.paths = {}
@@ -139,6 +140,7 @@ def _prefill_scheduler(pp_size: int, tp_size: int, host: str, notify_port: int):
         blocks_per_sw=[0],
         _global_dp_rank=0,
         engine_id="prefill",
+        incarnation="prefill-1",
         host_ip=host,
         handshake_port=HANDSHAKE_PORT,
         side_notify_port=notify_port,

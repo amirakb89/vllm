@@ -32,6 +32,7 @@ def _producer(global_dp_rank: int, dp_size: int, dp_size_local: int):
         blocks_per_sw=[0],
         _global_dp_rank=global_dp_rank,
         engine_id="engine-abc",
+        incarnation="prefill-1",
         host_ip="10.0.0.1",
         handshake_port=6300,
         side_notify_port=7300,

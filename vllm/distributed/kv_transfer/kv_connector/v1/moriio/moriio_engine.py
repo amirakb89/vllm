@@ -857,6 +857,12 @@ class MoRIIOWrapper:
         self.moriio_engine.register_remote_engine(consumer_engine_metadata)
         return consumer_engine_metadata.key
 
+    def deregister_remote_engine(self, remote_packed_engine_metadata):
+        assert self.moriio_engine is not None, "MoRIIO engine must be set first"
+        self.moriio_engine.deregister_remote_engine(
+            EngineDesc.unpack(remote_packed_engine_metadata)
+        )
+
     def register_local_tensor(self, tensor: torch.Tensor):
         assert self.moriio_engine is not None, "MoRIIO engine must be set first"
         try:

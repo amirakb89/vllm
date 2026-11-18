@@ -171,6 +171,12 @@ Pipeline parallelism is supported only on a prefill instance (`kv_producer`) in 
 !!! note
     GLM-5 (`GlmMoeDsaForCausalLM`) layers reuse the sparse-attention top-k selection of the nearest earlier layer that runs the indexer, so a pipeline stage must start on a layer that runs its own indexer (for GLM-5.2: layers 0, 1, 2, 6, 10, ..., 74). vLLM's default split of the 78 layers at pipeline size 4 (19, 20, 20, 19) does not; set `VLLM_PP_LAYER_PARTITION=22,20,20,16`.
 
+### Restarted prefill instances
+
+In READ mode, a decode instance keeps its sessions to a prefill instance until that prefill instance restarts. The prefill instance returns its launch in the request's `kv_transfer_params` (`remote_incarnation`), so the router must forward the parameters it returns unchanged. When a request comes from a prefill instance that restarted since the sessions were built, the decode instance drops them and connects to the new prefill instance in the same step. A request whose KV the previous prefill instance computed cannot be read any more: it fails as a load error under `kv_load_failure_policy`, except on hybrid (Mamba) models, where load errors cannot be recovered yet and the decode instance stops.
+
+Restarts in WRITE mode are not detected yet.
+
 ### Transport configuration
 
 MoRI has two transport backends: RDMA and xGMI. You can select backend using `--kv-transfer-config.kv_connector_extra_config.backend $BACKEND`, with `$BACKEND` being `rdma` or `xgmi`. RDMA is the default backend and should be used in multi-node deployments.
